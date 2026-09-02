@@ -20,16 +20,38 @@ class DiscoveryService {
   RawDatagramSocket? _socket;
   Timer? _broadcastTimer;
   final _deviceFoundController = StreamController<DeviceModel>.broadcast();
+  final Set<String> _acknowledgedIds = {};
 
   /// Emits a DeviceModel every time we hear from someone on the network
   /// (including repeated "still here" pings from a device we already know).
   Stream<DeviceModel> get onDeviceFound => _deviceFoundController.stream;
+
+  // Kept so restart() can rebind with the same identity without the
+  // caller having to pass everything in again.
+  String? _selfId;
+  String? _selfName;
+  String? _selfPlatform;
 
   Future<void> start({
     required String selfId,
     required String selfName,
     required String selfPlatform,
   }) async {
+    _selfId = selfId;
+    _selfName = selfName;
+    _selfPlatform = selfPlatform;
+
+    await _bindSocket();
+
+    _broadcastTimer = Timer.periodic(AppConstants.broadcastInterval, (_) {
+      _sendHello(selfId, selfName, selfPlatform);
+    });
+    // Don't make the user wait a full interval for the first ping.
+    _sendHello(selfId, selfName, selfPlatform);
+  }
+
+  Future<void> _bindSocket() async {
+    _socket?.close();
     _socket = await RawDatagramSocket.bind(
       InternetAddress.anyIPv4,
       AppConstants.discoveryPort,
@@ -40,27 +62,42 @@ class DiscoveryService {
       if (event != RawSocketEvent.read) return;
       final datagram = _socket!.receive();
       if (datagram == null) return;
-      _handleIncomingPacket(datagram, selfId);
+      _handleIncomingPacket(datagram, _selfId ?? '');
     });
+  }
 
-    _broadcastTimer = Timer.periodic(AppConstants.broadcastInterval, (_) {
-      _sendHello(selfId, selfName, selfPlatform);
-    });
-    // Don't make the user wait a full interval for the first ping.
-    _sendHello(selfId, selfName, selfPlatform);
+  /// Closes and reopens the UDP socket, keeping the same broadcast timer
+  /// running. Fixes the case where Android/Windows silently stops
+  /// delivering broadcasts after a network change (join/leave hotspot,
+  /// Wi-Fi reconnect) without requiring the user to restart the app.
+  Future<void> restart() async {
+    if (_selfId == null) return; // start() was never called
+    await _bindSocket();
   }
 
   void _sendHello(String id, String name, String platform) {
-    final payload = jsonEncode({
-      'tag': AppConstants.protocolTag,
-      'id': id,
-      'name': name,
-      'platform': platform,
-      'port': AppConstants.discoveryPort,
-    });
-    final data = utf8.encode(payload);
+    final data = utf8.encode(_buildPayload(id, name, platform));
     _socket?.send(data, InternetAddress('255.255.255.255'), AppConstants.discoveryPort);
   }
+
+  /// Sends the same "hello" packet, but straight to one specific IP
+  /// instead of broadcasting to the whole subnet. Used for manual
+  /// connect: some hotspot setups filter/limit broadcast traffic but
+  /// still allow plain unicast UDP between two known addresses, so this
+  /// is the fallback when auto-discovery finds nothing.
+  void sendDirectHello(String targetIp) {
+    if (_selfId == null || _selfName == null || _selfPlatform == null) return;
+    final data = utf8.encode(_buildPayload(_selfId!, _selfName!, _selfPlatform!));
+    _socket?.send(data, InternetAddress(targetIp), AppConstants.discoveryPort);
+  }
+
+  String _buildPayload(String id, String name, String platform) => jsonEncode({
+        'tag': AppConstants.protocolTag,
+        'id': id,
+        'name': name,
+        'platform': platform,
+        'port': AppConstants.discoveryPort,
+      });
 
   void _handleIncomingPacket(Datagram datagram, String selfId) {
     try {
@@ -74,6 +111,13 @@ class DiscoveryService {
 
       final device = DeviceModel.fromJson(json, datagram.address.address);
       _deviceFoundController.add(device);
+
+      // First time we've heard from this id: ping it directly back once.
+      // This means only ONE side needs to type the other's IP manually —
+      // the other side auto-discovers via this reply.
+      if (_acknowledgedIds.add(device.id)) {
+        sendDirectHello(datagram.address.address);
+      }
     } catch (_) {
       // Malformed packet — just drop it, never crash discovery over it.
     }

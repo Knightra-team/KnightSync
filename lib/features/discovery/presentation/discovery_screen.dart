@@ -15,8 +15,21 @@ class DiscoveryScreen extends StatelessWidget {
   }
 }
 
-class _DiscoveryView extends StatelessWidget {
+class _DiscoveryView extends StatefulWidget {
   const _DiscoveryView();
+
+  @override
+  State<_DiscoveryView> createState() => _DiscoveryViewState();
+}
+
+class _DiscoveryViewState extends State<_DiscoveryView> {
+  final _ipController = TextEditingController();
+
+  @override
+  void dispose() {
+    _ipController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -35,6 +48,11 @@ class _DiscoveryView extends StatelessWidget {
                     'Device: ${controller.selfName}',
                     style: Theme.of(context).textTheme.titleMedium,
                   ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Your IP: ${controller.selfIp ?? 'unknown'}',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
                   const SizedBox(height: 8),
                   Row(
                     children: [
@@ -51,10 +69,33 @@ class _DiscoveryView extends StatelessWidget {
                       ),
                     ],
                   ),
+                  const SizedBox(height: 16),
+                  // Fallback for hotspot setups where broadcast doesn't
+                  // reach the other device: type its IP directly.
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _ipController,
+                          keyboardType: TextInputType.number,
+                          decoration: const InputDecoration(
+                            labelText: 'Or enter partner\'s IP (hotspot)',
+                            isDense: true,
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      FilledButton(
+                        onPressed: () => controller.connectManually(_ipController.text),
+                        child: const Text('Connect'),
+                      ),
+                    ],
+                  ),
                   const SizedBox(height: 24),
                   Expanded(
                     child: controller.devices.isEmpty
-                        ? const Center(child: Text('Waiting for devices on the same Wi-Fi...'))
+                        ? const Center(child: Text('Waiting for devices on the same network...'))
                         : ListView.builder(
                             itemCount: controller.devices.length,
                             itemBuilder: (context, index) {

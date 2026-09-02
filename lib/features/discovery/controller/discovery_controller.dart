@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import '../../../core/constants/app_constants.dart';
+import '../../../core/utils/network_utils.dart';
 import '../../../models/device_model.dart';
 import '../../../services/local_device_service.dart';
 import '../data/discovery_service.dart';
@@ -16,10 +17,12 @@ class DiscoveryController extends ChangeNotifier {
 
   StreamSubscription<DeviceModel>? _subscription;
   Timer? _cleanupTimer;
+  Timer? _rebindTimer;
 
   String? selfId;
   String selfName = '...';
   String selfPlatform = '...';
+  String? selfIp;
   bool isReady = false;
 
   List<DeviceModel> get devices => _devices.values.toList()
@@ -29,10 +32,21 @@ class DiscoveryController extends ChangeNotifier {
     selfId = await LocalDeviceService.getOrCreateDeviceId();
     selfName = await LocalDeviceService.getDeviceName();
     selfPlatform = LocalDeviceService.getPlatformName();
+    selfIp = await NetworkUtils.getLocalIPv4();
     isReady = true;
     notifyListeners();
 
     await _startDiscovery();
+  }
+
+  /// Fallback for when auto-discovery (broadcast) finds nothing — e.g.
+  /// hotspot setups that limit broadcast traffic. The user types the
+  /// other device's IP (shown on that device's own screen as "Your IP"),
+  /// and we ping it directly.
+  void connectManually(String ip) {
+    final trimmed = ip.trim();
+    if (trimmed.isEmpty) return;
+    _discoveryService.sendDirectHello(trimmed);
   }
 
   Future<void> _startDiscovery() async {
@@ -61,11 +75,18 @@ class DiscoveryController extends ChangeNotifier {
         notifyListeners();
       }
     });
+
+    // Self-heal from the "socket goes deaf after network change" issue —
+    // no user action (closing/reopening the app) should be needed.
+    _rebindTimer = Timer.periodic(AppConstants.socketRebindInterval, (_) {
+      _discoveryService.restart();
+    });
   }
 
   @override
   void dispose() {
     _cleanupTimer?.cancel();
+    _rebindTimer?.cancel();
     _subscription?.cancel();
     _discoveryService.dispose();
     super.dispose();

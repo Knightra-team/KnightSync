@@ -22,4 +22,11 @@ class AppConstants {
   /// the network (closed the app, disconnected Wi-Fi, etc.) and remove
   /// it from the list.
   static const Duration deviceTimeout = Duration(seconds: 6);
+
+  /// On Android especially, a UDP socket can go "deaf" after the OS
+  /// switches Wi-Fi networks (join hotspot, rejoin router, etc.) — it
+  /// stays open but silently stops receiving broadcasts. Rebinding the
+  /// socket periodically is a cheap way to self-heal from that without
+  /// needing the user to restart the app.
+  static const Duration socketRebindInterval = Duration(seconds: 15);
 }
