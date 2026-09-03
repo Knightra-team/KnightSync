@@ -1,4 +1,4 @@
-name: knightrasync
+name: knightsync
 description: "A new Flutter project."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
@@ -44,6 +44,9 @@ dependencies:
 
   # Human-readable device name (phone model / PC name)
   device_info_plus: ^10.1.0
+
+  file_picker: ^10.3.10
+  path_provider: ^2.1.6
 
 dev_dependencies:
   flutter_test:

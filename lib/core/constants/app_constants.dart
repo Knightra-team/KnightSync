@@ -29,4 +29,14 @@ class AppConstants {
   /// socket periodically is a cheap way to self-heal from that without
   /// needing the user to restart the app.
   static const Duration socketRebindInterval = Duration(seconds: 15);
+
+  /// TCP port used for actual file transfer (separate from the UDP
+  /// discovery port above — one device can be discoverable without a
+  /// transfer in progress, and vice versa).
+  static const int fileTransferPort = 45733;
+
+  /// Subfolder (inside the app's own documents directory) where files
+  /// received from other devices are saved. App-private storage means
+  /// no extra runtime permission is needed on Android for this MVP.
+  static const String downloadFolderName = 'KnightRaSyncReceived';
 }

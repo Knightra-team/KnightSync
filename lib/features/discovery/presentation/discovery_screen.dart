@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../file_transfer/presentation/file_transfer_screen.dart';
 import '../controller/discovery_controller.dart';
 
 class DiscoveryScreen extends StatelessWidget {
@@ -110,9 +111,15 @@ class _DiscoveryViewState extends State<_DiscoveryView> {
                                   title: Text(device.name),
                                   subtitle: Text('${device.ip} • ${device.platform}'),
                                   trailing: FilledButton(
-                                    // Pairing feature (next milestone) will
-                                    // implement what happens here.
-                                    onPressed: () {},
+                                    // Pairing/trust step isn't built yet
+                                    // (next milestone) — for now, tapping
+                                    // Connect goes straight to sending
+                                    // files with this device.
+                                    onPressed: () => Navigator.of(context).push(
+                                      MaterialPageRoute(
+                                        builder: (_) => FileTransferScreen(device: device),
+                                      ),
+                                    ),
                                     child: const Text('Connect'),
                                   ),
                                 ),
