@@ -1,4 +1,4 @@
-# knightrasync
+# KnightSync
 
 A new Flutter project.
 

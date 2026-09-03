@@ -4,7 +4,7 @@
 class AppConstants {
   AppConstants._();
 
-  static const String appName = 'KnightRaSync';
+  static const String appName = 'KnightSync';
 
   /// UDP port both Android and Windows listen on for discovery broadcasts.
   /// Must be the same on both platforms, and ideally >1024 so it doesn't
@@ -38,5 +38,5 @@ class AppConstants {
   /// Subfolder (inside the app's own documents directory) where files
   /// received from other devices are saved. App-private storage means
   /// no extra runtime permission is needed on Android for this MVP.
-  static const String downloadFolderName = 'KnightRaSyncReceived';
+  static const String downloadFolderName = 'KnightSyncReceived';
 }

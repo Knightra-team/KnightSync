@@ -6,11 +6,11 @@ import 'features/file_transfer/controller/file_transfer_controller.dart';
 import 'services/local_device_service.dart';
 
 void main() {
-  runApp(const KnightRaSyncApp());
+  runApp(const KnightSyncApp());
 }
 
-class KnightRaSyncApp extends StatelessWidget {
-  const KnightRaSyncApp({super.key});
+class KnightSyncApp extends StatelessWidget {
+  const KnightSyncApp({super.key});
 
   @override
   Widget build(BuildContext context) {

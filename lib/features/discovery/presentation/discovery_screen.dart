@@ -37,7 +37,7 @@ class _DiscoveryViewState extends State<_DiscoveryView> {
     final controller = context.watch<DiscoveryController>();
 
     return Scaffold(
-      appBar: AppBar(title: const Text('KnightRaSync')),
+      appBar: AppBar(title: const Text('KnightSync')),
       body: !controller.isReady
           ? const Center(child: CircularProgressIndicator())
           : Padding(
