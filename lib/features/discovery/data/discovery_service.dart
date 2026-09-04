@@ -27,6 +27,8 @@ class DiscoveryService {
   String? _selfName;
   String? _selfPlatform;
 
+  bool _isBinding = false;
+
   Future<void> start({
     required String selfId,
     required String selfName,
@@ -40,57 +42,76 @@ class DiscoveryService {
 
     _broadcastTimer?.cancel();
 
-    _broadcastTimer =
-        Timer.periodic(AppConstants.broadcastInterval, (_) {
-      _sendHello(
-        selfId,
-        selfName,
-        selfPlatform,
-      );
-    });
-
-    _sendHello(
-      selfId,
-      selfName,
-      selfPlatform,
+    _broadcastTimer = Timer.periodic(
+      AppConstants.broadcastInterval,
+      (_) => _sendHelloToNetwork(),
     );
+
+    // Announce ourselves immediately.
+    _sendHelloToNetwork();
   }
 
   Future<void> _bindSocket() async {
-    _socket?.close();
+    if (_isBinding) return;
 
-    _socket = await RawDatagramSocket.bind(
-      InternetAddress.anyIPv4,
-      AppConstants.discoveryPort,
-    );
+    _isBinding = true;
 
-    _socket!.broadcastEnabled = true;
+    try {
+      _socket?.close();
+      _socket = null;
 
-    _socket!.listen((RawSocketEvent event) {
-      if (event != RawSocketEvent.read) return;
-
-      final datagram = _socket!.receive();
-
-      if (datagram == null) return;
-
-      _handleIncomingPacket(
-        datagram,
-        _selfId ?? '',
+      final socket = await RawDatagramSocket.bind(
+        InternetAddress.anyIPv4,
+        AppConstants.discoveryPort,
+        reuseAddress: true,
       );
-    });
+
+      socket.broadcastEnabled = true;
+
+      _socket = socket;
+
+      socket.listen((RawSocketEvent event) {
+        if (event != RawSocketEvent.read) return;
+
+        while (true) {
+          final datagram = socket.receive();
+
+          if (datagram == null) {
+            break;
+          }
+
+          _handleIncomingPacket(
+            datagram,
+            _selfId ?? '',
+          );
+        }
+      });
+    } finally {
+      _isBinding = false;
+    }
   }
 
   Future<void> restart() async {
     if (_selfId == null) return;
 
     await _bindSocket();
+
+    // Important:
+    // After rebinding, immediately announce ourselves again.
+    _sendHelloToNetwork();
   }
 
-  void _sendHello(
-    String id,
-    String name,
-    String platform,
-  ) {
+  void _sendHelloToNetwork() {
+    final id = _selfId;
+    final name = _selfName;
+    final platform = _selfPlatform;
+
+    if (id == null ||
+        name == null ||
+        platform == null) {
+      return;
+    }
+
     final data = utf8.encode(
       _buildPayload(
         id: id,
@@ -100,11 +121,79 @@ class DiscoveryService {
       ),
     );
 
-    _socket?.send(
+    final socket = _socket;
+
+    if (socket == null) return;
+
+    // Global broadcast.
+    _sendBroadcast(
+      socket,
       data,
-      InternetAddress('255.255.255.255'),
-      AppConstants.discoveryPort,
+      '255.255.255.255',
     );
+
+    // Local subnet broadcast.
+    //
+    // Some Android/Wi-Fi networks don't reliably deliver
+    // 255.255.255.255, so we also send x.x.x.255.
+    _sendSubnetBroadcasts(
+      socket,
+      data,
+    );
+  }
+
+  void _sendBroadcast(
+    RawDatagramSocket socket,
+    List<int> data,
+    String address,
+  ) {
+    try {
+      socket.send(
+        data,
+        InternetAddress(address),
+        AppConstants.discoveryPort,
+      );
+    } catch (_) {
+      // Ignore unavailable network interfaces.
+    }
+  }
+
+  Future<void> _sendSubnetBroadcasts(
+    RawDatagramSocket socket,
+    List<int> data,
+  ) async {
+    try {
+      final interfaces = await NetworkInterface.list(
+        type: InternetAddressType.IPv4,
+        includeLoopback: false,
+      );
+
+      final sent = <String>{};
+
+      for (final interface in interfaces) {
+        for (final address in interface.addresses) {
+          if (address.isLoopback) continue;
+
+          final parts = address.address.split('.');
+
+          if (parts.length != 4) continue;
+
+          // Most Wi-Fi and hotspot networks use /24.
+          final broadcast =
+              '${parts[0]}.${parts[1]}.${parts[2]}.255';
+
+          if (sent.add(broadcast)) {
+            _sendBroadcast(
+              socket,
+              data,
+              broadcast,
+            );
+          }
+        }
+      }
+    } catch (_) {
+      // Global broadcast was already attempted.
+    }
   }
 
   void sendConnectionRequest(String targetIp) {
@@ -123,11 +212,15 @@ class DiscoveryService {
       ),
     );
 
-    _socket?.send(
-      data,
-      InternetAddress(targetIp),
-      AppConstants.discoveryPort,
-    );
+    try {
+      _socket?.send(
+        data,
+        InternetAddress(targetIp),
+        AppConstants.discoveryPort,
+      );
+    } catch (_) {
+      // Ignore unavailable target.
+    }
   }
 
   void sendDirectHello(String targetIp) {
@@ -146,11 +239,15 @@ class DiscoveryService {
       ),
     );
 
-    _socket?.send(
-      data,
-      InternetAddress(targetIp),
-      AppConstants.discoveryPort,
-    );
+    try {
+      _socket?.send(
+        data,
+        InternetAddress(targetIp),
+        AppConstants.discoveryPort,
+      );
+    } catch (_) {
+      // Ignore unavailable target.
+    }
   }
 
   String _buildPayload({
@@ -174,12 +271,16 @@ class DiscoveryService {
     String selfId,
   ) {
     try {
-      final message = utf8.decode(datagram.data);
+      final message = utf8.decode(
+        datagram.data,
+      );
 
       final json =
-          jsonDecode(message) as Map<String, dynamic>;
+          jsonDecode(message)
+              as Map<String, dynamic>;
 
-      if (json['tag'] != AppConstants.protocolTag) {
+      if (json['tag'] !=
+          AppConstants.protocolTag) {
         return;
       }
 
@@ -195,14 +296,19 @@ class DiscoveryService {
       final type =
           json['type'] as String? ?? 'hello';
 
+      // IMPORTANT:
+      // Every valid device packet is immediately
+      // sent to the UI.
+      _deviceFoundController.add(device);
+
       if (type == 'connect_request') {
-        _deviceFoundController.add(device);
-        _connectionRequestController.add(device);
+        _connectionRequestController.add(
+          device,
+        );
         return;
       }
 
-      _deviceFoundController.add(device);
-
+      // Reply directly once.
       if (_acknowledgedIds.add(device.id)) {
         sendDirectHello(
           datagram.address.address,
@@ -219,6 +325,8 @@ class DiscoveryService {
 
     _socket?.close();
     _socket = null;
+
+    _acknowledgedIds.clear();
   }
 
   void dispose() {
