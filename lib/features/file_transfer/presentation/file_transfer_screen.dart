@@ -17,8 +17,7 @@ class FileTransferScreen
   @override
   Widget build(BuildContext context) {
     final controller =
-        context.watch<
-            FileTransferController>();
+        context.watch<FileTransferController>();
 
     return Scaffold(
       appBar: AppBar(
@@ -120,10 +119,10 @@ class _TransferTile
               Text(
                 isCompleted
                     ? isIncoming
-                        ? 'Received — saved in '
-                            'Downloads/KnightSync'
-                        : 'Sent — receiver '
-                            'confirmed the file'
+                        ? 'Received successfully'
+                        : 'Sent successfully — '
+                            'receiver confirmed '
+                            'the file'
                     : 'Failed: '
                         '${task.errorMessage ?? 'unknown error'}',
                 style: TextStyle(
@@ -133,13 +132,27 @@ class _TransferTile
                 ),
               ),
 
+            // ---------------------------------------------------------
+            // Show the REAL saved path on Android.
+            // ---------------------------------------------------------
+
             if (isIncoming &&
                 isCompleted &&
                 task.savedPath != null) ...[
               const SizedBox(height: 4),
               Text(
+                'Saved to:',
+                style: Theme.of(context)
+                    .textTheme
+                    .bodySmall
+                    ?.copyWith(
+                      fontWeight:
+                          FontWeight.bold,
+                    ),
+              ),
+              Text(
                 task.savedPath!,
-                maxLines: 2,
+                maxLines: 3,
                 overflow:
                     TextOverflow.ellipsis,
                 style: Theme.of(context)
