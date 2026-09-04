@@ -9,26 +9,12 @@ import 'package:uuid/uuid.dart';
 import '../../../core/constants/app_constants.dart';
 import '../models/transfer_task.dart';
 
-/// The actual file-transfer networking. No Flutter/UI imports here on
-/// purpose — same reasoning as DiscoveryService: testable and reusable
-/// outside a widget tree.
-///
-/// Wire protocol per connection (deliberately tiny, no external libs):
-/// 1. Sender opens a TCP connection to the receiver's
-///    [AppConstants.fileTransferPort].
-/// 2. Sender writes one UTF-8 JSON line, newline-terminated:
-///    {tag, id, name, fileName, fileSize}.
-/// 3. Sender then writes exactly fileSize raw bytes — no further framing,
-///    because the receiver already knows how much to expect from the
-///    header, and closes the socket when done.
 class FileTransferService {
   static const _uuid = Uuid();
 
   ServerSocket? _server;
   final _updateController = StreamController<TransferTask>.broadcast();
 
-  /// Emits a TransferTask snapshot every time a transfer is created,
-  /// makes progress, completes, or fails — for both directions.
   Stream<TransferTask> get onUpdate => _updateController.stream;
 
   String? _selfId;
@@ -40,67 +26,118 @@ class FileTransferService {
   }) async {
     _selfId = selfId;
     _selfName = selfName;
+
     await _server?.close();
+
     _server = await ServerSocket.bind(
       InternetAddress.anyIPv4,
       AppConstants.fileTransferPort,
     );
-    _server!.listen(_handleIncomingConnection, onError: (_) {});
+
+    _server!.listen(
+      _handleIncomingConnection,
+      onError: (_) {},
+    );
   }
 
-  // ---------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
   // Receiving
-  // ---------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   Future<void> _handleIncomingConnection(Socket socket) async {
     final taskId = _uuid.v4();
+
     final headerBytes = <int>[];
     var headerParsed = false;
+
     IOSink? sink;
     File? file;
     TransferTask? task;
+
     var received = 0;
     var fileSize = 0;
+
     final done = Completer<void>();
 
     late final StreamSubscription<Uint8List> sub;
+
     sub = socket.listen(
       (chunk) async {
-        // Pause immediately (synchronously, before any await) so the
-        // next chunk can't arrive and be processed out of order while
-        // we're still awaiting file I/O for this one.
         sub.pause();
+
         try {
           var offset = 0;
 
+          // ---------------------------------------------------------------
+          // Header
+          // ---------------------------------------------------------------
+
           if (!headerParsed) {
-            final newlineIndex = chunk.indexOf(10); // '\n'
+            final newlineIndex = chunk.indexOf(10); // \n
+
             if (newlineIndex == -1) {
               headerBytes.addAll(chunk);
               sub.resume();
               return;
             }
-            headerBytes.addAll(chunk.sublist(0, newlineIndex));
+
+            headerBytes.addAll(
+              chunk.sublist(0, newlineIndex),
+            );
+
             offset = newlineIndex + 1;
             headerParsed = true;
 
             final json =
-                jsonDecode(utf8.decode(headerBytes)) as Map<String, dynamic>;
+                jsonDecode(utf8.decode(headerBytes))
+                    as Map<String, dynamic>;
+
             if (json['tag'] != AppConstants.protocolTag) {
               await sub.cancel();
               socket.destroy();
-              if (!done.isCompleted) done.complete();
+
+              if (!done.isCompleted) {
+                done.complete();
+              }
+
               return;
             }
 
-            final fileName = json['fileName'] as String;
-            fileSize = json['fileSize'] as int;
-            final peerName = json['name'] as String? ?? 'Unknown device';
-            final peerIp = socket.remoteAddress.address;
+            final fileName =
+                json['fileName'] as String;
 
-            final dir = await _downloadDirectory();
-            final safeName = await _uniqueFileName(dir, fileName);
-            file = File('${dir.path}${Platform.pathSeparator}$safeName');
+            fileSize =
+                json['fileSize'] as int;
+
+            final peerName =
+                json['name'] as String? ??
+                    'Unknown device';
+
+            final peerIp =
+                socket.remoteAddress.address;
+
+            // -------------------------------------------------------------
+            // Determine destination folder
+            // -------------------------------------------------------------
+
+            final dir =
+                await _downloadDirectory(fileName);
+
+            final safeName =
+                _sanitizeFileName(fileName);
+
+            final uniqueName =
+                await _uniqueFileName(
+              dir,
+              safeName,
+            );
+
+            file = File(
+              '${dir.path}'
+              '${Platform.pathSeparator}'
+              '$uniqueName',
+            );
+
             sink = file!.openWrite();
 
             task = TransferTask(
@@ -108,38 +145,89 @@ class FileTransferService {
               fileName: fileName,
               totalBytes: fileSize,
               transferredBytes: 0,
-              direction: TransferDirection.incoming,
-              status: TransferStatus.inProgress,
+              direction:
+                  TransferDirection.incoming,
+              status:
+                  TransferStatus.inProgress,
               peerName: peerName,
               peerIp: peerIp,
             );
+
             _updateController.add(task!);
           }
 
+          // ---------------------------------------------------------------
+          // File body
+          // ---------------------------------------------------------------
+
           if (task != null && offset < chunk.length) {
             final body = chunk.sublist(offset);
-            final remaining = fileSize - received;
+
+            final remaining =
+                fileSize - received;
+
             final toWrite =
-                body.length > remaining ? body.sublist(0, remaining) : body;
+                body.length > remaining
+                    ? body.sublist(0, remaining)
+                    : body;
+
             if (toWrite.isNotEmpty) {
               sink!.add(toWrite);
+
               received += toWrite.length;
-              task = task!.copyWith(transferredBytes: received);
+
+              task = task!.copyWith(
+                transferredBytes: received,
+              );
+
               _updateController.add(task!);
             }
           }
 
-          if (task != null && received >= fileSize) {
+          // ---------------------------------------------------------------
+          // Transfer completed
+          // ---------------------------------------------------------------
+
+          if (task != null &&
+              received >= fileSize) {
             await sub.cancel();
+
             await sink!.flush();
             await sink!.close();
+
             task = task!.copyWith(
-              status: TransferStatus.completed,
+              status:
+                  TransferStatus.completed,
               savedPath: file!.path,
             );
+
             _updateController.add(task!);
-            socket.destroy();
-            if (!done.isCompleted) done.complete();
+
+            // Tell sender that the file was REALLY saved.
+            final ack = jsonEncode({
+              'tag':
+                  AppConstants.protocolTag,
+              'type': 'transfer_ack',
+              'id': taskId,
+              'success': true,
+            });
+
+            socket.add(
+              utf8.encode('$ack\n'),
+            );
+
+            await socket.flush();
+
+            await Future<void>.delayed(
+              const Duration(milliseconds: 100),
+            );
+
+            await socket.close();
+
+            if (!done.isCompleted) {
+              done.complete();
+            }
+
             return;
           }
 
@@ -147,28 +235,53 @@ class FileTransferService {
         } catch (e) {
           await sub.cancel();
           await sink?.close();
-          _emitFailure(taskId, task, socket, e);
+
+          _emitFailure(
+            taskId,
+            task,
+            socket,
+            e,
+          );
+
           socket.destroy();
-          if (!done.isCompleted) done.complete();
+
+          if (!done.isCompleted) {
+            done.complete();
+          }
         }
       },
       onError: (Object e) async {
         await sink?.close();
-        _emitFailure(taskId, task, socket, e);
-        if (!done.isCompleted) done.complete();
+
+        _emitFailure(
+          taskId,
+          task,
+          socket,
+          e,
+        );
+
+        if (!done.isCompleted) {
+          done.complete();
+        }
       },
       onDone: () async {
-        // Socket closed before we ever reached fileSize bytes — the
-        // sender crashed, lost network, or the user cancelled mid-send.
-        if (task != null && received < fileSize) {
+        if (task != null &&
+            received < fileSize) {
           await sink?.close();
+
           task = task!.copyWith(
-            status: TransferStatus.failed,
-            errorMessage: 'Connection closed before the transfer finished',
+            status:
+                TransferStatus.failed,
+            errorMessage:
+                'Connection closed before the transfer finished',
           );
+
           _updateController.add(task!);
         }
-        if (!done.isCompleted) done.complete();
+
+        if (!done.isCompleted) {
+          done.complete();
+        }
       },
       cancelOnError: true,
     );
@@ -176,54 +289,238 @@ class FileTransferService {
     await done.future;
   }
 
-  void _emitFailure(String id, TransferTask? task, Socket socket, Object e) {
+  void _emitFailure(
+    String id,
+    TransferTask? task,
+    Socket socket,
+    Object e,
+  ) {
     final base = task ??
         TransferTask(
           id: id,
           fileName: 'unknown',
           totalBytes: 0,
           transferredBytes: 0,
-          direction: TransferDirection.incoming,
-          status: TransferStatus.inProgress,
+          direction:
+              TransferDirection.incoming,
+          status:
+              TransferStatus.inProgress,
           peerName: 'Unknown device',
-          peerIp: socket.remoteAddress.address,
+          peerIp:
+              socket.remoteAddress.address,
         );
+
     _updateController.add(
-      base.copyWith(status: TransferStatus.failed, errorMessage: e.toString()),
+      base.copyWith(
+        status: TransferStatus.failed,
+        errorMessage: e.toString(),
+      ),
     );
   }
 
-  Future<Directory> _downloadDirectory() async {
-    final base = await getApplicationDocumentsDirectory();
+  // ---------------------------------------------------------------------------
+  // Android / Windows destination
+  // ---------------------------------------------------------------------------
+
+  Future<Directory> _downloadDirectory(
+    String fileName,
+  ) async {
+    if (Platform.isAndroid) {
+      final root =
+          Directory('/storage/emulated/0');
+
+      final category =
+          _categoryForFile(fileName);
+
+      final dir = Directory(
+        '${root.path}'
+        '${Platform.pathSeparator}'
+        '${AppConstants.downloadFolderName}'
+        '${Platform.pathSeparator}'
+        '$category',
+      );
+
+      if (!await dir.exists()) {
+        await dir.create(recursive: true);
+      }
+
+      return dir;
+    }
+
+    // Windows / other platforms:
+    // Keep the existing app Documents behavior.
+    final base =
+        await getApplicationDocumentsDirectory();
+
     final dir = Directory(
-      '${base.path}${Platform.pathSeparator}${AppConstants.downloadFolderName}',
+      '${base.path}'
+      '${Platform.pathSeparator}'
+      '${AppConstants.downloadFolderName}',
     );
+
     if (!await dir.exists()) {
       await dir.create(recursive: true);
     }
+
     return dir;
   }
 
-  /// Avoids silently overwriting a file the user already received —
-  /// appends " (1)", " (2)", etc. before the extension until the name
-  /// is free.
-  Future<String> _uniqueFileName(Directory dir, String original) async {
+  String _categoryForFile(
+    String fileName,
+  ) {
+    final extension =
+        fileName.contains('.')
+            ? fileName
+                .split('.')
+                .last
+                .toLowerCase()
+            : '';
+
+    const images = {
+      'jpg',
+      'jpeg',
+      'png',
+      'gif',
+      'webp',
+      'bmp',
+      'heic',
+      'heif',
+      'tiff',
+      'svg',
+    };
+
+    const videos = {
+      'mp4',
+      'mkv',
+      'avi',
+      'mov',
+      'wmv',
+      'flv',
+      'webm',
+      '3gp',
+      'm4v',
+    };
+
+    const audio = {
+      'mp3',
+      'wav',
+      'm4a',
+      'aac',
+      'flac',
+      'ogg',
+      'opus',
+      'wma',
+    };
+
+    const documents = {
+      'pdf',
+      'doc',
+      'docx',
+      'xls',
+      'xlsx',
+      'ppt',
+      'pptx',
+      'txt',
+      'csv',
+      'rtf',
+      'zip',
+      'rar',
+      '7z',
+      'tar',
+      'gz',
+      'json',
+      'xml',
+    };
+
+    if (images.contains(extension)) {
+      return 'Images';
+    }
+
+    if (videos.contains(extension)) {
+      return 'Videos';
+    }
+
+    if (audio.contains(extension)) {
+      return 'Audio';
+    }
+
+    if (documents.contains(extension)) {
+      return 'Documents';
+    }
+
+    return 'Other';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Filename handling
+  // ---------------------------------------------------------------------------
+
+  String _sanitizeFileName(
+    String original,
+  ) {
+    var name = original.trim();
+
+    if (name.isEmpty) {
+      name = 'file';
+    }
+
+    // Remove path separators and Windows-invalid characters.
+    name = name.replaceAll(
+      RegExp(r'[\\/:*?"<>|]'),
+      '_',
+    );
+
+    // Prevent traversal.
+    name = name.replaceAll('..', '_');
+
+    // Remove control characters.
+    name = name.replaceAll(
+      RegExp(r'[\x00-\x1F]'),
+      '_',
+    );
+
+    if (name.isEmpty) {
+      return 'file';
+    }
+
+    return name;
+  }
+
+  Future<String> _uniqueFileName(
+    Directory dir,
+    String original,
+  ) async {
     var candidate = original;
     var counter = 1;
-    while (await File('${dir.path}${Platform.pathSeparator}$candidate')
-        .exists()) {
-      final dotIndex = original.lastIndexOf('.');
-      candidate = dotIndex <= 0
-          ? '$original ($counter)'
-          : '${original.substring(0, dotIndex)} ($counter)${original.substring(dotIndex)}';
+
+    while (
+        await File(
+          '${dir.path}'
+          '${Platform.pathSeparator}'
+          '$candidate',
+        ).exists()) {
+      final dotIndex =
+          original.lastIndexOf('.');
+
+      if (dotIndex <= 0) {
+        candidate =
+            '$original ($counter)';
+      } else {
+        candidate =
+            '${original.substring(0, dotIndex)}'
+            ' ($counter)'
+            '${original.substring(dotIndex)}';
+      }
+
       counter++;
     }
+
     return candidate;
   }
 
-  // ---------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
   // Sending
-  // ---------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
 
   Future<void> sendFile({
     required String targetIp,
@@ -232,49 +529,152 @@ class FileTransferService {
     required String fileName,
   }) async {
     final taskId = _uuid.v4();
-    final fileSize = await file.length();
+
+    final fileSize =
+        await file.length();
+
     var task = TransferTask(
       id: taskId,
       fileName: fileName,
       totalBytes: fileSize,
       transferredBytes: 0,
-      direction: TransferDirection.outgoing,
-      status: TransferStatus.inProgress,
+      direction:
+          TransferDirection.outgoing,
+      status:
+          TransferStatus.inProgress,
       peerName: peerName,
       peerIp: targetIp,
     );
+
     _updateController.add(task);
 
     Socket? socket;
+
     try {
       socket = await Socket.connect(
         targetIp,
         AppConstants.fileTransferPort,
-        timeout: const Duration(seconds: 10),
+        timeout:
+            const Duration(seconds: 10),
+      );
+
+      // Listen for receiver ACK.
+      final ackCompleter =
+          Completer<bool>();
+
+      final subscription =
+          socket.listen(
+        (data) {
+          try {
+            final text =
+                utf8.decode(data);
+
+            for (final line
+                in text.split('\n')) {
+              if (line.trim().isEmpty) {
+                continue;
+              }
+
+              final json =
+                  jsonDecode(line)
+                      as Map<String, dynamic>;
+
+              if (json['type'] ==
+                      'transfer_ack' &&
+                  json['id'] == taskId) {
+                if (!ackCompleter
+                    .isCompleted) {
+                  ackCompleter.complete(
+                    json['success'] == true,
+                  );
+                }
+              }
+            }
+          } catch (_) {
+            // Ignore malformed ACK data.
+          }
+        },
+        onError: (_) {
+          if (!ackCompleter
+              .isCompleted) {
+            ackCompleter.complete(false);
+          }
+        },
       );
 
       final header = jsonEncode({
-        'tag': AppConstants.protocolTag,
-        'id': _selfId,
+        'tag':
+            AppConstants.protocolTag,
+        'type': 'file_transfer',
+        'id': taskId,
         'name': _selfName,
         'fileName': fileName,
         'fileSize': fileSize,
       });
-      socket.add(utf8.encode('$header\n'));
+
+      socket.add(
+        utf8.encode('$header\n'),
+      );
 
       var sent = 0;
-      await for (final chunk in file.openRead()) {
+
+      await for (final chunk
+          in file.openRead()) {
         socket.add(chunk);
+
         await socket.flush();
+
         sent += chunk.length;
-        task = task.copyWith(transferredBytes: sent);
+
+        task = task.copyWith(
+          transferredBytes: sent,
+        );
+
         _updateController.add(task);
       }
 
-      task = task.copyWith(status: TransferStatus.completed);
+      // ---------------------------------------------------------------
+      // IMPORTANT:
+      // Do NOT mark completed here.
+      // Wait until receiver confirms the file was saved.
+      // ---------------------------------------------------------------
+
+      bool receiverConfirmed;
+
+      try {
+        receiverConfirmed =
+            await ackCompleter.future.timeout(
+          const Duration(seconds: 15),
+        );
+      } on TimeoutException {
+        receiverConfirmed = false;
+      }
+
+      await subscription.cancel();
+
+      if (receiverConfirmed) {
+        task = task.copyWith(
+          status:
+              TransferStatus.completed,
+        );
+      } else {
+        task = task.copyWith(
+          status:
+              TransferStatus.failed,
+          errorMessage:
+              'Receiver did not confirm that the file was saved',
+        );
+      }
+
       _updateController.add(task);
     } catch (e) {
-      task = task.copyWith(status: TransferStatus.failed, errorMessage: e.toString());
+      task = task.copyWith(
+        status:
+            TransferStatus.failed,
+        errorMessage:
+            e.toString(),
+      );
+
       _updateController.add(task);
     } finally {
       await socket?.close();

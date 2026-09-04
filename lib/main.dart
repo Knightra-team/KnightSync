@@ -6,23 +6,20 @@ import 'features/file_transfer/controller/file_transfer_controller.dart';
 import 'services/local_device_service.dart';
 
 void main() {
-  runApp(const KnightSyncApp());
+  runApp(
+    const KnightSyncApp(),
+  );
 }
 
-class KnightSyncApp extends StatelessWidget {
+class KnightSyncApp
+    extends StatelessWidget {
   const KnightSyncApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    // The provider MUST live above MaterialApp, not around a single
-    // screen. Every route pushed via Navigator (DiscoveryScreen,
-    // FileTransferScreen, ...) is its own subtree next to the Navigator,
-    // not a descendant of whichever screen pushed it — so a provider
-    // placed inside one screen is invisible to routes pushed after it.
-    // Putting it here, above MaterialApp/Navigator entirely, means every
-    // route can see it.
     return ChangeNotifierProvider(
-      create: (_) => FileTransferController(),
+      create: (_) =>
+          FileTransferController(),
       child: const _App(),
     );
   }
@@ -32,7 +29,8 @@ class _App extends StatefulWidget {
   const _App();
 
   @override
-  State<_App> createState() => _AppState();
+  State<_App> createState() =>
+      _AppState();
 }
 
 class _AppState extends State<_App> {
@@ -41,17 +39,24 @@ class _AppState extends State<_App> {
   @override
   void initState() {
     super.initState();
+
     _initFuture = _init();
   }
 
-  /// Starts the file-transfer server once, before any screen is shown,
-  /// so this device can receive files even if the user never opens the
-  /// transfer screen themselves.
   Future<void> _init() async {
-    final selfId = await LocalDeviceService.getOrCreateDeviceId();
-    final selfName = await LocalDeviceService.getDeviceName();
+    final selfId =
+        await LocalDeviceService
+            .getOrCreateDeviceId();
+
+    final selfName =
+        await LocalDeviceService
+            .getDeviceName();
+
     if (!mounted) return;
-    await context.read<FileTransferController>().init(
+
+    await context
+        .read<FileTransferController>()
+        .init(
           selfId: selfId,
           selfName: selfName,
         );
@@ -64,15 +69,26 @@ class _AppState extends State<_App> {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        colorSchemeSeed: Colors.indigo,
-        brightness: Brightness.dark,
+        colorSchemeSeed:
+            Colors.indigo,
+        brightness:
+            Brightness.dark,
       ),
       home: FutureBuilder<void>(
         future: _initFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        builder:
+            (context, snapshot) {
+          if (snapshot
+                  .connectionState !=
+              ConnectionState.done) {
+            return const Scaffold(
+              body: Center(
+                child:
+                    CircularProgressIndicator(),
+              ),
+            );
           }
+
           return const DiscoveryScreen();
         },
       ),
