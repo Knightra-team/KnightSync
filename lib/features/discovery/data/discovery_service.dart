@@ -7,16 +7,17 @@ import '../../../models/device_model.dart';
 
 class DiscoveryService {
   RawDatagramSocket? _socket;
+
   Timer? _broadcastTimer;
   Timer? _hotspotProbeTimer;
 
-  final _deviceFoundController =
+  final StreamController<DeviceModel> _deviceFoundController =
       StreamController<DeviceModel>.broadcast();
 
-  final _connectionRequestController =
+  final StreamController<DeviceModel> _connectionRequestController =
       StreamController<DeviceModel>.broadcast();
 
-  final Set<String> _acknowledgedIds = {};
+  final Set<String> _acknowledgedIds = <String>{};
 
   Stream<DeviceModel> get onDeviceFound =>
       _deviceFoundController.stream;
@@ -31,6 +32,10 @@ class DiscoveryService {
   bool _isBinding = false;
   bool _isSendingSubnetBroadcasts = false;
   bool _isProbingHotspot = false;
+
+  // ---------------------------------------------------------------------------
+  // START
+  // ---------------------------------------------------------------------------
 
   Future<void> start({
     required String selfId,
@@ -48,25 +53,30 @@ class DiscoveryService {
 
     _broadcastTimer = Timer.periodic(
       AppConstants.broadcastInterval,
-      (_) => _sendHelloToNetwork(),
+      (_) {
+        _sendHelloToNetwork();
+      },
     );
 
-    // Broadcast is enough on most routers, but some mobile hotspots
-    // isolate or drop broadcast traffic. The probe sends the same
-    // discovery hello directly to all possible peers on the local /24
-    // subnet, so discovery still works over a two-device hotspot.
     _hotspotProbeTimer = Timer.periodic(
       AppConstants.hotspotProbeInterval,
-      (_) => _probeLocalSubnets(),
+      (_) {
+        _probeLocalSubnets();
+      },
     );
 
-    // Announce and probe immediately.
     _sendHelloToNetwork();
     _probeLocalSubnets();
   }
 
+  // ---------------------------------------------------------------------------
+  // SOCKET
+  // ---------------------------------------------------------------------------
+
   Future<void> _bindSocket() async {
-    if (_isBinding) return;
+    if (_isBinding) {
+      return;
+    }
 
     _isBinding = true;
 
@@ -74,49 +84,69 @@ class DiscoveryService {
       _socket?.close();
       _socket = null;
 
-      final socket = await RawDatagramSocket.bind(
+      final RawDatagramSocket socket =
+          await RawDatagramSocket.bind(
         InternetAddress.anyIPv4,
         AppConstants.discoveryPort,
         reuseAddress: true,
       );
 
       socket.broadcastEnabled = true;
+
       _socket = socket;
 
-      socket.listen((RawSocketEvent event) {
-        if (event != RawSocketEvent.read) return;
+      socket.listen(
+        (RawSocketEvent event) {
+          if (event != RawSocketEvent.read) {
+            return;
+          }
 
-        while (true) {
-          final datagram = socket.receive();
+          while (true) {
+            final Datagram? datagram = socket.receive();
 
-          if (datagram == null) break;
+            if (datagram == null) {
+              break;
+            }
 
-          _handleIncomingPacket(
-            datagram,
-            _selfId ?? '',
-          );
-        }
-      });
+            _handleIncomingPacket(
+              datagram,
+              _selfId ?? '',
+            );
+          }
+        },
+        onError: (_) {
+          // Ignore socket errors.
+        },
+      );
+    } catch (_) {
+      _socket = null;
     } finally {
       _isBinding = false;
     }
   }
 
   Future<void> restart() async {
-    if (_selfId == null) return;
+    if (_selfId == null) {
+      return;
+    }
 
     await _bindSocket();
 
-    // Re-announce after rebinding.
     _sendHelloToNetwork();
     _probeLocalSubnets();
   }
 
-  void _sendHelloToNetwork() {
-    final data = _helloData();
-    final socket = _socket;
+  // ---------------------------------------------------------------------------
+  // DISCOVERY
+  // ---------------------------------------------------------------------------
 
-    if (data == null || socket == null) return;
+  void _sendHelloToNetwork() {
+    final List<int>? data = _helloData();
+    final RawDatagramSocket? socket = _socket;
+
+    if (data == null || socket == null) {
+      return;
+    }
 
     // Global broadcast.
     _sendUdp(
@@ -125,33 +155,46 @@ class DiscoveryService {
       InternetAddress('255.255.255.255'),
     );
 
-    // Local subnet broadcasts.
-    _sendSubnetBroadcasts(socket, data);
+    // Interface-specific broadcasts.
+    _sendSubnetBroadcasts(
+      socket,
+      data,
+    );
   }
 
   Future<void> _sendSubnetBroadcasts(
     RawDatagramSocket socket,
     List<int> data,
   ) async {
-    if (_isSendingSubnetBroadcasts) return;
+    if (_isSendingSubnetBroadcasts) {
+      return;
+    }
+
     _isSendingSubnetBroadcasts = true;
 
     try {
-      final interfaces = await NetworkInterface.list(
+      final List<NetworkInterface> interfaces =
+          await NetworkInterface.list(
         type: InternetAddressType.IPv4,
         includeLoopback: false,
       );
 
-      final sent = <String>{};
+      final Set<String> sent = <String>{};
 
-      for (final interface in interfaces) {
-        for (final address in interface.addresses) {
-          if (address.isLoopback) continue;
+      for (final NetworkInterface networkInterface
+          in interfaces) {
+        for (final address
+            in networkInterface.addresses) {
+          if (_isLoopbackAddress(address)) {
+            continue;
+          }
 
-          final subnet = _subnetPrefix(address.address);
-          if (subnet == null) continue;
+          final String? broadcast =
+              _broadcastAddress(address);
 
-          final broadcast = '$subnet.255';
+          if (broadcast == null) {
+            continue;
+          }
 
           if (sent.add(broadcast)) {
             _sendUdp(
@@ -169,73 +212,222 @@ class DiscoveryService {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // HOTSPOT / DIRECT PROBE
+  // ---------------------------------------------------------------------------
+
   Future<void> _probeLocalSubnets() async {
-    if (_isProbingHotspot) return;
+    if (_isProbingHotspot) {
+      return;
+    }
 
-    final socket = _socket;
-    final data = _helloData();
+    final RawDatagramSocket? socket = _socket;
+    final List<int>? data = _helloData();
 
-    if (socket == null || data == null) return;
+    if (socket == null || data == null) {
+      return;
+    }
 
     _isProbingHotspot = true;
 
     try {
-      final interfaces = await NetworkInterface.list(
+      final List<NetworkInterface> interfaces =
+          await NetworkInterface.list(
         type: InternetAddressType.IPv4,
         includeLoopback: false,
       );
 
-      final prefixes = <String>{};
+      final Set<String> ranges = <String>{};
 
-      for (final interface in interfaces) {
-        for (final address in interface.addresses) {
-          if (address.isLoopback) continue;
+      for (final NetworkInterface networkInterface
+          in interfaces) {
+        for (final address
+            in networkInterface.addresses) {
+          if (_isLoopbackAddress(address)) {
+            continue;
+          }
 
-          final prefix = _subnetPrefix(address.address);
-          if (prefix != null) {
-            prefixes.add(prefix);
+          final String? range =
+              _smallSubnetRange(address);
+
+          if (range != null) {
+            ranges.add(range);
           }
         }
       }
 
-      for (final prefix in prefixes) {
-        for (var host = 1; host <= 254; host++) {
-          final target = '$prefix.$host';
+      for (final String range in ranges) {
+        final List<String> parts =
+            range.split(':');
 
+        if (parts.length != 2) {
+          continue;
+        }
+
+        final String network = parts[0];
+
+        final int? hostCount =
+            int.tryParse(parts[1]);
+
+        if (hostCount == null ||
+            hostCount <= 1) {
+          continue;
+        }
+
+        for (int host = 1;
+            host < hostCount;
+            host++) {
           _sendUdp(
             socket,
             data,
-            InternetAddress(target),
+            InternetAddress(
+              '$network.$host',
+            ),
           );
         }
       }
     } catch (_) {
-      // A failed probe must never stop normal broadcast discovery.
+      // A failed probe must never stop discovery.
     } finally {
       _isProbingHotspot = false;
     }
   }
 
-  String? _subnetPrefix(String ip) {
-    final parts = ip.split('.');
+  // ---------------------------------------------------------------------------
+  // NETWORK HELPERS
+  //
+  // IMPORTANT:
+  // We intentionally do NOT use InterfaceAddress here.
+  // ---------------------------------------------------------------------------
 
-    if (parts.length != 4) return null;
-
-    final numbers = parts.map(int.tryParse).toList();
-
-    if (numbers.any((value) => value == null)) {
-      return null;
+  bool _isLoopbackAddress(dynamic address) {
+    try {
+      return address.isLoopback == true;
+    } catch (_) {
+      return false;
     }
-
-    return '${parts[0]}.${parts[1]}.${parts[2]}';
   }
 
-  List<int>? _helloData() {
-    final id = _selfId;
-    final name = _selfName;
-    final platform = _selfPlatform;
+  String? _broadcastAddress(dynamic address) {
+    try {
+      final dynamic broadcast =
+          address.broadcast;
 
-    if (id == null || name == null || platform == null) {
+      if (broadcast == null) {
+        return null;
+      }
+
+      final dynamic value =
+          broadcast.address;
+
+      if (value is! String ||
+          value.isEmpty) {
+        return null;
+      }
+
+      return value;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  String? _smallSubnetRange(dynamic address) {
+    try {
+      final dynamic addressValue =
+          address.address;
+
+      final dynamic prefixValue =
+          address.prefixLength;
+
+      if (addressValue is! String) {
+        return null;
+      }
+
+      if (prefixValue is! int) {
+        return null;
+      }
+
+      final String ip = addressValue;
+      final int prefixLength = prefixValue;
+
+      final List<String> parts =
+          ip.split('.');
+
+      if (parts.length != 4) {
+        return null;
+      }
+
+      final List<int?> numbers =
+          parts.map<int?>(
+        (String value) {
+          return int.tryParse(value);
+        },
+      ).toList();
+
+      if (numbers.any(
+        (int? value) => value == null,
+      )) {
+        return null;
+      }
+
+      // Only probe reasonably small networks.
+      //
+      // /23 = 512 addresses
+      // /24 = 256 addresses
+      // /25 = 128 addresses
+      // /26 = 64 addresses
+      // /27 = 32 addresses
+      // /28 = 16 addresses
+      // /29 = 8 addresses
+      // /30 = 4 addresses
+      if (prefixLength < 23 ||
+          prefixLength > 30) {
+        return null;
+      }
+
+      final int hostBits =
+          32 - prefixLength;
+
+      final int hostCount =
+          1 << hostBits;
+
+      final int ipValue =
+          (numbers[0]! << 24) |
+          (numbers[1]! << 16) |
+          (numbers[2]! << 8) |
+          numbers[3]!;
+
+      final int mask =
+          (0xFFFFFFFF >> hostBits) <<
+              hostBits;
+
+      final int networkValue =
+          ipValue & mask;
+
+      final String network = [
+        (networkValue >> 24) & 0xFF,
+        (networkValue >> 16) & 0xFF,
+        (networkValue >> 8) & 0xFF,
+      ].join('.');
+
+      return '$network:$hostCount';
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // HELLO DATA
+  // ---------------------------------------------------------------------------
+
+  List<int>? _helloData() {
+    final String? id = _selfId;
+    final String? name = _selfName;
+    final String? platform = _selfPlatform;
+
+    if (id == null ||
+        name == null ||
+        platform == null) {
       return null;
     }
 
@@ -249,6 +441,10 @@ class DiscoveryService {
     );
   }
 
+  // ---------------------------------------------------------------------------
+  // UDP
+  // ---------------------------------------------------------------------------
+
   void _sendUdp(
     RawDatagramSocket socket,
     List<int> data,
@@ -261,17 +457,33 @@ class DiscoveryService {
         AppConstants.discoveryPort,
       );
     } catch (_) {
-      // Ignore unreachable interfaces/addresses.
+      // Ignore unavailable interfaces/addresses.
     }
   }
 
-  void sendConnectionRequest(String targetIp) {
-    final data = _connectionRequestData();
+  // ---------------------------------------------------------------------------
+  // CONNECTION REQUEST
+  // ---------------------------------------------------------------------------
 
-    if (data == null) return;
+  void sendConnectionRequest(
+    String targetIp,
+  ) {
+    final List<int>? data =
+        _connectionRequestData();
+
+    if (data == null) {
+      return;
+    }
+
+    final RawDatagramSocket? socket =
+        _socket;
+
+    if (socket == null) {
+      return;
+    }
 
     try {
-      _socket?.send(
+      socket.send(
         data,
         InternetAddress(targetIp),
         AppConstants.discoveryPort,
@@ -281,13 +493,29 @@ class DiscoveryService {
     }
   }
 
-  void sendDirectHello(String targetIp) {
-    final data = _helloData();
+  // ---------------------------------------------------------------------------
+  // DIRECT HELLO
+  // ---------------------------------------------------------------------------
 
-    if (data == null) return;
+  void sendDirectHello(
+    String targetIp,
+  ) {
+    final List<int>? data =
+        _helloData();
+
+    if (data == null) {
+      return;
+    }
+
+    final RawDatagramSocket? socket =
+        _socket;
+
+    if (socket == null) {
+      return;
+    }
 
     try {
-      _socket?.send(
+      socket.send(
         data,
         InternetAddress(targetIp),
         AppConstants.discoveryPort,
@@ -296,13 +524,19 @@ class DiscoveryService {
       // Ignore unavailable target.
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // CONNECTION REQUEST DATA
+  // ---------------------------------------------------------------------------
 
   List<int>? _connectionRequestData() {
-    final id = _selfId;
-    final name = _selfName;
-    final platform = _selfPlatform;
+    final String? id = _selfId;
+    final String? name = _selfName;
+    final String? platform = _selfPlatform;
 
-    if (id == null || name == null || platform == null) {
+    if (id == null ||
+        name == null ||
+        platform == null) {
       return null;
     }
 
@@ -315,6 +549,10 @@ class DiscoveryService {
       ),
     );
   }
+
+  // ---------------------------------------------------------------------------
+  // PAYLOAD
+  // ---------------------------------------------------------------------------
 
   String _buildPayload({
     required String id,
@@ -332,17 +570,31 @@ class DiscoveryService {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // RECEIVE
+  // ---------------------------------------------------------------------------
+
   void _handleIncomingPacket(
     Datagram datagram,
     String selfId,
   ) {
     try {
-      final message = utf8.decode(datagram.data);
+      final String message =
+          utf8.decode(datagram.data);
 
-      final json =
-          jsonDecode(message) as Map<String, dynamic>;
+      final dynamic decoded =
+          jsonDecode(message);
 
-      if (json['tag'] != AppConstants.protocolTag) {
+      if (decoded
+          is! Map<String, dynamic>) {
+        return;
+      }
+
+      final Map<String, dynamic> json =
+          decoded;
+
+      if (json['tag'] !=
+          AppConstants.protocolTag) {
         return;
       }
 
@@ -350,25 +602,35 @@ class DiscoveryService {
         return;
       }
 
-      final device = DeviceModel.fromJson(
+      final DeviceModel device =
+          DeviceModel.fromJson(
         json,
         datagram.address.address,
       );
 
-      final type =
-          json['type'] as String? ?? 'hello';
+      final String type =
+          json['type'] as String? ??
+              'hello';
 
-      // Every valid hello refreshes the device in the UI.
-      _deviceFoundController.add(device);
+      // Every valid packet refreshes the device.
+      _deviceFoundController.add(
+        device,
+      );
 
       if (type == 'connect_request') {
-        _connectionRequestController.add(device);
+        _connectionRequestController
+            .add(device);
+
         return;
       }
 
-      // Reply directly once. This helps devices that cannot receive
-      // hotspot/router broadcasts but can receive normal unicast UDP.
-      if (_acknowledgedIds.add(device.id)) {
+      // Answer the peer once.
+      //
+      // This is useful when broadcast is blocked
+      // but unicast UDP still works.
+      if (_acknowledgedIds.add(
+        device.id,
+      )) {
         sendDirectHello(
           datagram.address.address,
         );
@@ -377,6 +639,10 @@ class DiscoveryService {
       // Ignore malformed UDP packets.
     }
   }
+
+  // ---------------------------------------------------------------------------
+  // STOP
+  // ---------------------------------------------------------------------------
 
   void stop() {
     _broadcastTimer?.cancel();
@@ -389,7 +655,14 @@ class DiscoveryService {
     _socket = null;
 
     _acknowledgedIds.clear();
+
+    _isSendingSubnetBroadcasts = false;
+    _isProbingHotspot = false;
   }
+
+  // ---------------------------------------------------------------------------
+  // DISPOSE
+  // ---------------------------------------------------------------------------
 
   void dispose() {
     stop();

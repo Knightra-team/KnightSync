@@ -81,6 +81,36 @@ class _DiscoveryViewState
     );
   }
 
+  void _openManualDevice(
+    BuildContext context,
+    DiscoveryController controller,
+  ) {
+    final device =
+        controller.connectManually(
+      _ipController.text,
+    );
+
+    if (device == null) {
+      ScaffoldMessenger.of(context)
+          .showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Please enter a valid IPv4 address.',
+          ),
+        ),
+      );
+      return;
+    }
+
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => FileTransferScreen(
+          device: device,
+        ),
+      ),
+    );
+  }
+
   @override
   void dispose() {
     _connectionSubscription?.cancel();
@@ -103,7 +133,8 @@ class _DiscoveryViewState
               child: CircularProgressIndicator(),
             )
           : Padding(
-              padding: const EdgeInsets.all(16),
+              padding:
+                  const EdgeInsets.all(16),
               child: Column(
                 crossAxisAlignment:
                     CrossAxisAlignment.start,
@@ -155,13 +186,16 @@ class _DiscoveryViewState
                     children: [
                       Expanded(
                         child: TextField(
-                          controller: _ipController,
+                          controller:
+                              _ipController,
                           keyboardType:
                               TextInputType.number,
                           decoration:
                               const InputDecoration(
                             labelText:
-                                'Or enter partner\'s IP (hotspot)',
+                                'Partner IP (manual fallback)',
+                            hintText:
+                                'Example: 192.168.43.1',
                             isDense: true,
                             border:
                                 OutlineInputBorder(),
@@ -172,11 +206,11 @@ class _DiscoveryViewState
                       const SizedBox(width: 8),
 
                       FilledButton(
-                        onPressed: () {
-                          controller.connectManually(
-                            _ipController.text,
-                          );
-                        },
+                        onPressed: () =>
+                            _openManualDevice(
+                          context,
+                          controller,
+                        ),
                         child:
                             const Text('Connect'),
                       ),
@@ -229,8 +263,9 @@ class _DiscoveryViewState
                                         context,
                                       ).push(
                                         MaterialPageRoute(
-                                          builder: (_) =>
-                                              FileTransferScreen(
+                                          builder:
+                                              (_) =>
+                                                  FileTransferScreen(
                                             device:
                                                 device,
                                           ),

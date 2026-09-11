@@ -61,14 +61,47 @@ class DiscoveryController extends ChangeNotifier {
     );
   }
 
-  void connectManually(String ip) {
+  /// Manual IP is a direct TCP fallback.
+  ///
+  /// We do not depend on the UDP discovery request here. If the user
+  /// already knows the peer IP, the transfer screen can connect directly
+  /// to port 45733. This makes manual pairing useful even when hotspot
+  /// UDP discovery is blocked.
+  DeviceModel? connectManually(String ip) {
     final trimmed = ip.trim();
 
-    if (trimmed.isEmpty) return;
+    if (trimmed.isEmpty || !_isValidIPv4(trimmed)) {
+      return null;
+    }
 
-    _discoveryService.sendConnectionRequest(
-      trimmed,
+    _discoveryService.sendConnectionRequest(trimmed);
+
+    return DeviceModel(
+      id: 'manual:$trimmed',
+      name: 'Manual device',
+      platform: 'unknown',
+      ip: trimmed,
+      port: AppConstants.fileTransferPort,
+      lastSeen: DateTime.now(),
     );
+  }
+
+  bool _isValidIPv4(String value) {
+    final parts = value.split('.');
+
+    if (parts.length != 4) return false;
+
+    for (final part in parts) {
+      final number = int.tryParse(part);
+
+      if (number == null ||
+          number < 0 ||
+          number > 255) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   Future<void> _startDiscovery() async {

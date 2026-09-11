@@ -9,12 +9,13 @@ class AppConstants {
   static const Duration broadcastInterval =
       Duration(seconds: 2);
 
-  // Used when normal UDP broadcast is blocked by a mobile hotspot.
+  // Hotspots can block UDP broadcast. Unicast probing is the fallback.
   static const Duration hotspotProbeInterval =
-      Duration(seconds: 8);
+      Duration(seconds: 4);
 
+  // Must be longer than the hotspot probe interval.
   static const Duration deviceTimeout =
-      Duration(seconds: 6);
+      Duration(seconds: 10);
 
   static const Duration socketRebindInterval =
       Duration(seconds: 15);
