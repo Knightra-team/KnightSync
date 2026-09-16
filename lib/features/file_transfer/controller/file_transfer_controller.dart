@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 
+import '../../../models/connection_request.dart';
 import '../../../models/device_model.dart';
 import '../data/file_transfer_service.dart';
 import '../models/transfer_task.dart';
@@ -23,6 +24,13 @@ class FileTransferController extends ChangeNotifier {
 
   bool isServerReady = false;
 
+  /// Fires whenever a peer asks to connect. This is the reliable,
+  /// TCP-based handshake — listening screens should use this (not
+  /// UDP discovery) to know when to show an incoming request, and
+  /// must call `request.respond(...)` once the user decides.
+  Stream<ConnectionRequest> get onConnectionRequest =>
+      _service.onConnectionRequest;
+
   /// Newest activity first.
   List<TransferTask> get tasks =>
       _tasks.values.toList()
@@ -33,6 +41,7 @@ class FileTransferController extends ChangeNotifier {
   Future<void> init({
     required String selfId,
     required String selfName,
+    required String selfPlatform,
   }) async {
     _subscription =
         _service.onUpdate.listen((task) {
@@ -47,10 +56,19 @@ class FileTransferController extends ChangeNotifier {
     await _service.startServer(
       selfId: selfId,
       selfName: selfName,
+      selfPlatform: selfPlatform,
     );
 
     isServerReady = true;
     notifyListeners();
+  }
+
+  /// Asks [targetIp] to connect. The peer must accept before this
+  /// resolves as `accepted` — see [ConnectionRequestResult].
+  Future<ConnectionRequestResult> requestConnection(
+    String targetIp,
+  ) {
+    return _service.sendConnectionRequest(targetIp);
   }
 
   /// Opens the system file picker and sends

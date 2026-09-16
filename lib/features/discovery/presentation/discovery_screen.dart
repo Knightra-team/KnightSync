@@ -3,6 +3,10 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../../core/constants/app_constants.dart';
+import '../../../models/connection_request.dart';
+import '../../../models/device_model.dart';
+import '../../file_transfer/controller/file_transfer_controller.dart';
 import '../../file_transfer/presentation/file_transfer_screen.dart';
 import '../controller/discovery_controller.dart';
 
@@ -30,10 +34,14 @@ class _DiscoveryViewState
     extends State<_DiscoveryView> {
   final _ipController = TextEditingController();
 
-  StreamSubscription<dynamic>?
+  StreamSubscription<ConnectionRequest>?
       _connectionSubscription;
 
-  String? _openedForDeviceId;
+  // Which peer id currently has a dialog/screen open, so a device
+  // that sends more than one packet (or a slow network) doesn't pop
+  // duplicate dialogs or screens for the same request.
+  String? _pendingRequestDeviceId;
+  bool _connecting = false;
 
   @override
   void didChangeDependencies() {
@@ -43,54 +51,195 @@ class _DiscoveryViewState
       return;
     }
 
-    final controller =
-        context.read<DiscoveryController>();
+    // This is the TCP handshake channel (same always-listening
+    // server used for real transfers), not UDP discovery — it's
+    // what actually reaches the peer reliably. It asks the user
+    // before doing anything; nothing opens automatically.
+    final fileTransferController =
+        context.read<FileTransferController>();
 
-    _connectionSubscription =
-        controller.onConnectionRequest.listen(
-      (device) {
-        if (!mounted) return;
-
-        if (_openedForDeviceId == device.id) {
-          return;
-        }
-
-        _openedForDeviceId = device.id;
-
-        WidgetsBinding.instance
-            .addPostFrameCallback((_) {
-          if (!mounted) return;
-
-          Navigator.of(context)
-              .push(
-                MaterialPageRoute(
-                  builder: (_) =>
-                      FileTransferScreen(
-                    device: device,
-                  ),
-                ),
-              )
-              .then((_) {
-            if (mounted &&
-                _openedForDeviceId == device.id) {
-              _openedForDeviceId = null;
-            }
-          });
-        });
-      },
-    );
+    _connectionSubscription = fileTransferController
+        .onConnectionRequest
+        .listen(_showIncomingRequest);
   }
 
-  void _openManualDevice(
+  void _showIncomingRequest(ConnectionRequest request) {
+    if (!mounted) return;
+
+    if (_pendingRequestDeviceId == request.device.id) {
+      return;
+    }
+
+    _pendingRequestDeviceId = request.device.id;
+
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) async {
+      if (!mounted) {
+        request.respond(false);
+        return;
+      }
+
+      BuildContext? dialogContext;
+
+      // Mirror the sender-side timeout locally so the dialog doesn't
+      // sit there forever if the user ignores it — the peer gives up
+      // waiting after the same duration anyway.
+      final autoDismiss = Timer(
+        AppConstants.connectionRequestTimeout,
+        () {
+          if (dialogContext != null) {
+            Navigator.of(dialogContext!).pop(false);
+          }
+        },
+      );
+
+      final accepted = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (ctx) {
+          dialogContext = ctx;
+
+          return AlertDialog(
+            title: const Text('Connection request'),
+            content: Text(
+              '${request.device.name} '
+              '(${request.device.ip}) wants to connect.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () =>
+                    Navigator.of(ctx).pop(false),
+                child: const Text('Decline'),
+              ),
+              FilledButton(
+                onPressed: () =>
+                    Navigator.of(ctx).pop(true),
+                child: const Text('Accept'),
+              ),
+            ],
+          );
+        },
+      );
+
+      autoDismiss.cancel();
+
+      request.respond(accepted ?? false);
+
+      if (!mounted) return;
+
+      if (accepted == true) {
+        await Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => FileTransferScreen(
+              device: request.device,
+            ),
+          ),
+        );
+      }
+
+      if (mounted &&
+          _pendingRequestDeviceId ==
+              request.device.id) {
+        _pendingRequestDeviceId = null;
+      }
+    });
+  }
+
+  Future<void> _connectTo(
+    BuildContext context,
+    DeviceModel device,
+  ) async {
+    if (_connecting) return;
+
+    setState(() => _connecting = true);
+
+    final fileTransferController =
+        context.read<FileTransferController>();
+
+    final result = await fileTransferController
+        .requestConnection(device.ip);
+
+    if (!mounted) return;
+
+    setState(() => _connecting = false);
+
+    final displayName =
+        device.name.isEmpty ? device.ip : device.name;
+
+    switch (result.status) {
+      case ConnectionRequestStatus.declined:
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '$displayName declined the connection.',
+            ),
+          ),
+        );
+        return;
+
+      case ConnectionRequestStatus.unreachable:
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              "Couldn't reach $displayName. Make sure "
+              'both devices are on the same network/'
+              'hotspot. On Windows, also check that '
+              'Windows Defender Firewall allows this '
+              'app on Private/Public networks '
+              '(inbound), and on Android check the app '
+              "has local-network permission — this is "
+              "usually why one direction works and the "
+              'other one doesn\'t.',
+            ),
+            duration: const Duration(seconds: 8),
+          ),
+        );
+        return;
+
+      case ConnectionRequestStatus.accepted:
+        final confirmed = result.device!;
+
+        // Merge in the peer's confirmed identity — a manually-typed
+        // IP starts out with a placeholder name/platform, this fills
+        // in the real ones from the handshake ack.
+        final resolvedDevice = DeviceModel(
+          id: confirmed.id,
+          name: confirmed.name,
+          platform: confirmed.platform,
+          ip: device.ip,
+          port: confirmed.port,
+          lastSeen: DateTime.now(),
+        );
+
+        _pendingRequestDeviceId = resolvedDevice.id;
+
+        if (!mounted) return;
+
+        await Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => FileTransferScreen(
+              device: resolvedDevice,
+            ),
+          ),
+        );
+
+        if (mounted &&
+            _pendingRequestDeviceId ==
+                resolvedDevice.id) {
+          _pendingRequestDeviceId = null;
+        }
+    }
+  }
+
+  void _connectManually(
     BuildContext context,
     DiscoveryController controller,
   ) {
-    final device =
-        controller.connectManually(
+    final ip = controller.validateManualIp(
       _ipController.text,
     );
 
-    if (device == null) {
+    if (ip == null) {
       ScaffoldMessenger.of(context)
           .showSnackBar(
         const SnackBar(
@@ -102,11 +251,15 @@ class _DiscoveryViewState
       return;
     }
 
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => FileTransferScreen(
-          device: device,
-        ),
+    _connectTo(
+      context,
+      DeviceModel(
+        id: 'manual:$ip',
+        name: '',
+        platform: 'unknown',
+        ip: ip,
+        port: 0,
+        lastSeen: DateTime.now(),
       ),
     );
   }
@@ -180,6 +333,21 @@ class _DiscoveryViewState
                     ],
                   ),
 
+                  const SizedBox(height: 4),
+
+                  Text(
+                    "On the same Wi-Fi router, devices should "
+                    "appear automatically. On a hotspot, "
+                    "discovery can be unreliable — enter the "
+                    "other device's IP below on either side; "
+                    "whoever you connect to will see a request "
+                    "and must accept it.",
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(color: Colors.grey),
+                  ),
+
                   const SizedBox(height: 16),
 
                   Row(
@@ -206,13 +374,23 @@ class _DiscoveryViewState
                       const SizedBox(width: 8),
 
                       FilledButton(
-                        onPressed: () =>
-                            _openManualDevice(
-                          context,
-                          controller,
-                        ),
-                        child:
-                            const Text('Connect'),
+                        onPressed: _connecting
+                            ? null
+                            : () =>
+                                _connectManually(
+                                  context,
+                                  controller,
+                                ),
+                        child: _connecting
+                            ? const SizedBox(
+                                width: 16,
+                                height: 16,
+                                child:
+                                    CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Text('Connect'),
                       ),
                     ],
                   ),
@@ -253,25 +431,13 @@ class _DiscoveryViewState
                                   ),
                                   trailing:
                                       FilledButton(
-                                    onPressed: () {
-                                      controller
-                                          .connect(
-                                        device,
-                                      );
-
-                                      Navigator.of(
-                                        context,
-                                      ).push(
-                                        MaterialPageRoute(
-                                          builder:
-                                              (_) =>
-                                                  FileTransferScreen(
-                                            device:
-                                                device,
-                                          ),
-                                        ),
-                                      );
-                                    },
+                                    onPressed: _connecting
+                                        ? null
+                                        : () =>
+                                            _connectTo(
+                                              context,
+                                              device,
+                                            ),
                                     child:
                                         const Text(
                                       'Connect',

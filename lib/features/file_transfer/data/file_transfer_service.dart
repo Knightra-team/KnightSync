@@ -7,6 +7,8 @@ import 'package:path_provider/path_provider.dart';
 import 'package:uuid/uuid.dart';
 
 import '../../../core/constants/app_constants.dart';
+import '../../../models/connection_request.dart';
+import '../../../models/device_model.dart';
 import '../models/transfer_task.dart';
 
 class FileTransferService {
@@ -16,18 +18,33 @@ class FileTransferService {
   final _updateController =
       StreamController<TransferTask>.broadcast();
 
+  // Fired whenever a peer asks to connect (see `sendConnectionRequest`
+  // below). This travels over the same TCP port/server as real file
+  // transfers, which is the channel we already know survives hotspot
+  // NAT/AP-isolation quirks better than UDP broadcast/unicast does.
+  // The UI must call `ConnectionRequest.respond(...)` — the peer is
+  // left waiting until it does (or it times out).
+  final _connectionRequestController =
+      StreamController<ConnectionRequest>.broadcast();
+
   Stream<TransferTask> get onUpdate =>
       _updateController.stream;
 
+  Stream<ConnectionRequest> get onConnectionRequest =>
+      _connectionRequestController.stream;
+
   String? _selfId;
   String? _selfName;
+  String? _selfPlatform;
 
   Future<void> startServer({
     required String selfId,
     required String selfName,
+    required String selfPlatform,
   }) async {
     _selfId = selfId;
     _selfName = selfName;
+    _selfPlatform = selfPlatform;
 
     await _server?.close();
 
@@ -40,6 +57,153 @@ class FileTransferService {
       _handleIncomingConnection,
       onError: (_) {},
     );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Connection request (handshake)
+  // ---------------------------------------------------------------------------
+  //
+  // One device connects to the other's already-open file-transfer
+  // port, says hello, and waits for an ack carrying the peer's real
+  // id/name/platform. Success here means a real file transfer will
+  // also work, since it's the exact same port. Both sides then open
+  // the transfer screen: the caller once this future resolves, the
+  // callee as soon as `onConnectionRequest` fires.
+
+  Future<ConnectionRequestResult> sendConnectionRequest(
+    String targetIp,
+  ) async {
+    final String? id = _selfId;
+    final String? name = _selfName;
+    final String? platform = _selfPlatform;
+
+    if (id == null || name == null || platform == null) {
+      return const ConnectionRequestResult(
+        status: ConnectionRequestStatus.unreachable,
+      );
+    }
+
+    Socket? socket;
+
+    try {
+      socket = await Socket.connect(
+        targetIp,
+        AppConstants.fileTransferPort,
+        timeout: AppConstants.socketConnectTimeout,
+      );
+
+      final resultCompleter =
+          Completer<ConnectionRequestResult>();
+      final buffer = <int>[];
+
+      void completeOnce(ConnectionRequestResult result) {
+        if (!resultCompleter.isCompleted) {
+          resultCompleter.complete(result);
+        }
+      }
+
+      final subscription = socket.listen(
+        (chunk) {
+          buffer.addAll(chunk);
+
+          final newlineIndex = buffer.indexOf(10);
+          if (newlineIndex == -1) {
+            return;
+          }
+
+          try {
+            final line = utf8.decode(
+              buffer.sublist(0, newlineIndex),
+            );
+
+            final json =
+                jsonDecode(line) as Map<String, dynamic>;
+
+            if (json['tag'] == AppConstants.protocolTag &&
+                json['type'] == 'connect_ack') {
+              final bool accepted =
+                  json['accepted'] == true;
+
+              completeOnce(
+                accepted
+                    ? ConnectionRequestResult(
+                        status: ConnectionRequestStatus
+                            .accepted,
+                        device: DeviceModel.fromJson(
+                          json,
+                          socket!.remoteAddress.address,
+                        ),
+                      )
+                    : const ConnectionRequestResult(
+                        status: ConnectionRequestStatus
+                            .declined,
+                      ),
+              );
+            } else {
+              completeOnce(
+                const ConnectionRequestResult(
+                  status:
+                      ConnectionRequestStatus.unreachable,
+                ),
+              );
+            }
+          } catch (_) {
+            completeOnce(
+              const ConnectionRequestResult(
+                status: ConnectionRequestStatus.unreachable,
+              ),
+            );
+          }
+        },
+        onError: (_) {
+          completeOnce(
+            const ConnectionRequestResult(
+              status: ConnectionRequestStatus.unreachable,
+            ),
+          );
+        },
+        onDone: () {
+          completeOnce(
+            const ConnectionRequestResult(
+              status: ConnectionRequestStatus.unreachable,
+            ),
+          );
+        },
+      );
+
+      final header = jsonEncode({
+        'tag': AppConstants.protocolTag,
+        'type': 'connect_request',
+        'id': id,
+        'name': name,
+        'platform': platform,
+        'port': AppConstants.fileTransferPort,
+      });
+
+      socket.add(utf8.encode('$header\n'));
+      await socket.flush();
+
+      ConnectionRequestResult result;
+
+      try {
+        result = await resultCompleter.future
+            .timeout(AppConstants.connectionRequestTimeout);
+      } on TimeoutException {
+        result = const ConnectionRequestResult(
+          status: ConnectionRequestStatus.unreachable,
+        );
+      }
+
+      await subscription.cancel();
+
+      return result;
+    } catch (_) {
+      return const ConnectionRequestResult(
+        status: ConnectionRequestStatus.unreachable,
+      );
+    } finally {
+      await socket?.close();
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -105,6 +269,76 @@ class FileTransferService {
                 AppConstants.protocolTag) {
               await sub.cancel();
               socket.destroy();
+
+              if (!done.isCompleted) {
+                done.complete();
+              }
+
+              return;
+            }
+
+            // ---------------------------------------------------------
+            // Connection request handshake.
+            //
+            // Not a file transfer — a peer just wants to know "are you
+            // reachable, and who are you". Answer with our own
+            // id/name/platform and let the caller (and our own
+            // `onConnectionRequest` listener) take it from there.
+            // ---------------------------------------------------------
+
+            if (json['type'] == 'connect_request') {
+              await sub.cancel();
+
+              final peerDevice = DeviceModel.fromJson(
+                json,
+                socket.remoteAddress.address,
+              );
+
+              final decisionCompleter = Completer<bool>();
+
+              final autoDeclineTimer = Timer(
+                AppConstants.connectionRequestTimeout,
+                () {
+                  if (!decisionCompleter.isCompleted) {
+                    decisionCompleter.complete(false);
+                  }
+                },
+              );
+
+              _connectionRequestController.add(
+                ConnectionRequest(
+                  device: peerDevice,
+                  onRespond: (bool userAccepted) {
+                    if (!decisionCompleter.isCompleted) {
+                      decisionCompleter.complete(
+                        userAccepted,
+                      );
+                    }
+                  },
+                ),
+              );
+
+              final accepted = await decisionCompleter.future;
+              autoDeclineTimer.cancel();
+
+              final ack = jsonEncode({
+                'tag': AppConstants.protocolTag,
+                'type': 'connect_ack',
+                'id': _selfId,
+                'name': _selfName,
+                'platform': _selfPlatform,
+                'port': AppConstants.fileTransferPort,
+                'accepted': accepted,
+              });
+
+              socket.add(utf8.encode('$ack\n'));
+              await socket.flush();
+
+              await Future<void>.delayed(
+                const Duration(milliseconds: 100),
+              );
+
+              await socket.close();
 
               if (!done.isCompleted) {
                 done.complete();
@@ -765,5 +999,6 @@ class FileTransferService {
   Future<void> dispose() async {
     await _server?.close();
     await _updateController.close();
+    await _connectionRequestController.close();
   }
 }

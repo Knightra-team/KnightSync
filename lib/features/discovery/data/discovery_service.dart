@@ -14,16 +14,10 @@ class DiscoveryService {
   final StreamController<DeviceModel> _deviceFoundController =
       StreamController<DeviceModel>.broadcast();
 
-  final StreamController<DeviceModel> _connectionRequestController =
-      StreamController<DeviceModel>.broadcast();
-
   final Set<String> _acknowledgedIds = <String>{};
 
   Stream<DeviceModel> get onDeviceFound =>
       _deviceFoundController.stream;
-
-  Stream<DeviceModel> get onConnectionRequest =>
-      _connectionRequestController.stream;
 
   String? _selfId;
   String? _selfName;
@@ -462,38 +456,6 @@ class DiscoveryService {
   }
 
   // ---------------------------------------------------------------------------
-  // CONNECTION REQUEST
-  // ---------------------------------------------------------------------------
-
-  void sendConnectionRequest(
-    String targetIp,
-  ) {
-    final List<int>? data =
-        _connectionRequestData();
-
-    if (data == null) {
-      return;
-    }
-
-    final RawDatagramSocket? socket =
-        _socket;
-
-    if (socket == null) {
-      return;
-    }
-
-    try {
-      socket.send(
-        data,
-        InternetAddress(targetIp),
-        AppConstants.discoveryPort,
-      );
-    } catch (_) {
-      // Ignore unavailable target.
-    }
-  }
-
-  // ---------------------------------------------------------------------------
   // DIRECT HELLO
   // ---------------------------------------------------------------------------
 
@@ -523,31 +485,6 @@ class DiscoveryService {
     } catch (_) {
       // Ignore unavailable target.
     }
-  }
-
-  // ---------------------------------------------------------------------------
-  // CONNECTION REQUEST DATA
-  // ---------------------------------------------------------------------------
-
-  List<int>? _connectionRequestData() {
-    final String? id = _selfId;
-    final String? name = _selfName;
-    final String? platform = _selfPlatform;
-
-    if (id == null ||
-        name == null ||
-        platform == null) {
-      return null;
-    }
-
-    return utf8.encode(
-      _buildPayload(
-        id: id,
-        name: name,
-        platform: platform,
-        type: 'connect_request',
-      ),
-    );
   }
 
   // ---------------------------------------------------------------------------
@@ -608,21 +545,14 @@ class DiscoveryService {
         datagram.address.address,
       );
 
-      final String type =
-          json['type'] as String? ??
-              'hello';
-
       // Every valid packet refreshes the device.
+      // (Actual connection requests now go over TCP via
+      // FileTransferService — see that file — since UDP is not
+      // reliable enough on hotspots for something a user is
+      // waiting on. This UDP channel is discovery-only.)
       _deviceFoundController.add(
         device,
       );
-
-      if (type == 'connect_request') {
-        _connectionRequestController
-            .add(device);
-
-        return;
-      }
 
       // Answer the peer once.
       //
@@ -668,6 +598,5 @@ class DiscoveryService {
     stop();
 
     _deviceFoundController.close();
-    _connectionRequestController.close();
   }
 }

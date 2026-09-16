@@ -52,6 +52,9 @@ class _AppState extends State<_App> {
         await LocalDeviceService
             .getDeviceName();
 
+    final selfPlatform =
+        LocalDeviceService.getPlatformName();
+
     if (!mounted) return;
 
     await context
@@ -59,6 +62,7 @@ class _AppState extends State<_App> {
         .init(
           selfId: selfId,
           selfName: selfName,
+          selfPlatform: selfPlatform,
         );
   }
 
